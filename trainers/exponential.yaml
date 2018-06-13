@@ -1,0 +1,13 @@
+---
+train:
+    learning_rate:
+        type: tensorflow.train.exponential_decay
+        _initial: 0.1
+        _default_batch_size: 128
+        decay_rate: 0.16
+        learning_rate: !arith >
+            $(train.learning_rate._initial) * math.sqrt(
+                $(system.batch_size_per_gpu) * $(system.num_gpus) /
+                $(train.learning_rate._default_batch_size))
+        decay_steps: 30  # number of epochs per decay
+        staircase: true

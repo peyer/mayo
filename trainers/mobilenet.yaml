@@ -1,0 +1,8 @@
+---
+_import: exponential.yaml
+train:
+    optimizer:
+        type: tensorflow.train.RMSPropOptimizer
+        decay: 0.9
+        momentum: 0.9
+        epsilon: 1.0

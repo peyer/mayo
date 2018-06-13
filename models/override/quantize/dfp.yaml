@@ -1,0 +1,12 @@
+---
+_import: ../_global.yaml
+_overrider:
+    weights: &quantizer
+        dynamic:
+            type: mayo.override.DGQuantizer
+            width: 16
+            overflow_rate: 0.0
+            should_update: true
+            stochastic: false
+            _priority: 90
+    biases: {<<: *quantizer}

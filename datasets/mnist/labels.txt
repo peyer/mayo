@@ -1,0 +1,10 @@
+zero
+one
+two
+three
+four
+five
+size
+seven
+eight
+nine

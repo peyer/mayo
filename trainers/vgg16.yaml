@@ -1,0 +1,10 @@
+---
+_import: exponential.yaml
+train:
+    learning_rate:
+        decay_steps: 20.0
+    optimizer:
+        type: tensorflow.train.GradientDescentOptimizer
+    pruner:
+        type: mean_std_based
+        alpha: 0.001

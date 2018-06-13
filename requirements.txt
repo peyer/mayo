@@ -1,0 +1,13 @@
+colorama; sys_platform == 'win32'
+docopt
+ipdb
+ipdbplugin
+ipython
+networkx
+nose
+Pillow
+PyYAML
+readline; sys_platform != 'win32'
+tensorflow
+tensorflow-gpu
+termcolor

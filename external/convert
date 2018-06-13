@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+The universal deep learning framework saved model converter.
+Usage:
+    {executable} <from_file> info [options]
+    {executable} <from_file> to <to_file> [options]
+    {executable} <from_file> replace <to_file>
+
+Arguments:
+    * <from_file> can be:
+{importers}
+    * <to_file> can be:
+{exporters}
+
+Options:
+    --dry-run           Performs a dry run, not actually changing anything
+                        but shows things to be changed.
+    --rules=<yaml>      See "Conversion Rules Definition YAML File" below.
+
+Conversion Rules Definition YAML File:
+    The YAML file could contain the following mappings:
+    * `rename` replaces keys with new keys given in the specified YAML file
+      using `re.sub`, written as:
+        rename: <ordered mapping>
+      Here, <ordered mapping> is filled with:
+        `<pattern>: <replacement>`
+      which we will apply the substitution in the order of pattern and
+      replacement pairs.
+    * The file could additionally contain a `permute` dictionary required by
+      tensor permutation.
+"""
+import os
+import re
+import collections
+
+import yaml
+import numpy as np
+import pickle
+from docopt import docopt
+
+__version__ = '0.0.1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+
+class Log(object):
+    def log(self, text, head):
+        print(head + ' ' + text)
+
+    def key(self, text):
+        self.log(text, '*')
+
+    def info(self, text):
+        self.log(text, '-')
+
+
+log = Log()
+
+
+class BaseImporter(object):
+    def __init__(self, file, rules):
+        super().__init__()
+        log.key('Importing with {}...'.format(self.__class__.__name__))
+        self.var_to_tensor = self._import(file, rules or {})
+
+    @property
+    def var_to_shape(self):
+        self.var_to_tensor.pop('mayo/config', None)
+        return {k: list(v.shape) for k, v in self.var_to_tensor.items()}
+
+    def _import(self, file, rules):
+        raise NotImplementedError
+
+
+class NumpyImporter(BaseImporter):
+    _encoding = 'ASCII'
+
+    @classmethod
+    def _import(cls, file, rules):
+        encoding = rules.get('encoding', cls._encoding)
+        return np.load(file, encoding=encoding).item()
+
+
+class CheckpointImporter(BaseImporter):
+    @staticmethod
+    def _import(file, rules):
+        import tensorflow as tf
+        reader = tf.train.NewCheckpointReader(file)
+        var_to_tensor = {}
+        for v in reader.get_variable_to_shape_map():
+            var_to_tensor[v] = reader.get_tensor(v)
+        return var_to_tensor
+
+
+class PickleImporter(BaseImporter):
+    @staticmethod
+    def _import(file, rules):
+        file = open(file, 'rb')
+        var_to_tensor = {}
+        for key, item in pickle.load(file).items():
+            var_to_tensor[key] = item.tolist()
+        return var_to_tensor
+
+
+class PyTorchImporter(BaseImporter):
+    @staticmethod
+    def _import(file, rules):
+        import torch
+        var_to_tensor = {}
+        for k, v in torch.load(file).items():
+            if isinstance(v, torch.nn.Parameter):
+                v = v.data
+            var_to_tensor[k] = v.numpy()
+        return var_to_tensor
+
+
+class HDF5Importer(BaseImporter):
+    @classmethod
+    def _traverse(cls, mapping):
+        if not isinstance(mapping, collections.Mapping):
+            return [mapping]
+        values = []
+        for k, v in mapping.items():
+            values += cls._traverse(v)
+        return values
+
+    @classmethod
+    def _import(cls, file, rules):
+        import h5py
+        tensors = cls._traverse(h5py.File(file, 'r'))
+        return {t.name: t[...] for t in tensors}
+
+
+def permute(var_to_tensor, rules):
+    for name, tensor in var_to_tensor.items():
+        actions = rules.get(name)
+        if actions is None:
+            actions = rules.get(tensor.ndim, [])
+        if not actions:
+            log.info('Not permuting {!r}.'.format(name))
+        for action in actions:
+            action = dict(action)
+            func = action.pop('type')
+            log.info(
+                'Performing {!r} on tensor {!r} of shape {} with params {}...'
+                .format(func, name, tensor.shape, action))
+            tensor = getattr(np, func)(tensor, **action)
+            log.info(
+                'Tensor {!r} now has shape {}.'.format(name, tensor.shape))
+        var_to_tensor[name] = tensor
+    return var_to_tensor
+
+
+class BaseExporter(object):
+    def __init__(self, var_to_tensor, rules):
+        super().__init__()
+        rules = (rules or {}).get('rename')
+        if rules:
+            self.var_to_tensor = self._rename(var_to_tensor, rules)
+        else:
+            self.var_to_tensor = var_to_tensor
+
+    @staticmethod
+    def _rename_map(variables, rules):
+        vvmap = {}
+        for v in variables:
+            nv = v
+            for pattern, replacement in rules.items():
+                if replacement is None:
+                    if re.findall(pattern, nv):
+                        break
+                else:
+                    try:
+                        nv = re.sub(pattern, replacement, nv)
+                    except re.error as e:
+                        raise SyntaxError(
+                            'Unable to replace pattern {!r} in {!r} with {!r}.'
+                            .format(pattern, nv, replacement))
+            else:
+                vvmap[v] = nv
+        return vvmap
+
+    def _rename(self, var_to_tensor, rules):
+        log.key('Renaming variables...')
+        rename_map = self._rename_map(var_to_tensor, rules)
+        new_var_to_tensor = {}
+        for v in var_to_tensor:
+            try:
+                nv = rename_map[v]
+            except KeyError:
+                log.info('Skipping {!r} as it is not required.'.format(v))
+                continue
+            if nv != v:
+                log.info('Renamed {!r} as {!r}.'.format(v, nv))
+            else:
+                log.info('{!r} is not renamed.'.format(v))
+            new_var_to_tensor[nv] = var_to_tensor[v]
+        return new_var_to_tensor
+
+    def export(self, file, dry_run=False):
+        if dry_run:
+            log.key('Dry run, not actually saving.')
+            return
+        log.key('Exporting with {}...'.format(self.__class__.__name__))
+        self._export(file)
+
+    def _export(self, file):
+        raise NotImplementedError
+
+
+class NumpyExporter(BaseExporter):
+    def _export(self, file):
+        np.save(file, self.var_to_tensor)
+
+
+class CheckpointExporter(BaseExporter):
+    def _export(self, file):
+        import tensorflow as tf
+        session = tf.Session()
+        new_vars = []
+        log.info('Instantiating variables...')
+        with session.as_default():
+            for var, tensor in self.var_to_tensor.items():
+                new_vars.append(tf.Variable(tensor, name=var))
+        log.info('Saving checkpoint with renamed variables...')
+        saver = tf.train.Saver()
+        session.run(tf.variables_initializer(new_vars))
+        saver.save(session, file, write_meta_graph=False)
+
+
+_importers = {
+    '': CheckpointImporter,
+    '.ckpt': CheckpointImporter,
+    '.npy': NumpyImporter,
+    '.pth': PyTorchImporter,
+    '.pkl': PickleImporter,
+    '.h5': HDF5Importer,
+    '.hdf5': HDF5Importer,
+}
+_exporters = {
+    '': CheckpointExporter,
+    '.npy': NumpyExporter,
+}
+
+
+def usage():
+    def format_porters(porters):
+        descs = []
+        for index, (suffix, porter) in enumerate(porters.items()):
+            if not suffix:
+                desc = 'a file without a suffix'
+            else:
+                desc = 'a {!r} file'.format(suffix)
+            final = ';'
+            if index == len(porters) - 2:
+                final = '; or'
+            elif index == len(porters) - 1:
+                final = '.'
+            descs.append(
+                '{}- {} ({}){}'.format(' ' * 8, desc, porter.__name__, final))
+        return '\n'.join(descs)
+
+    importers = format_porters(_importers)
+    exporters = format_porters(_exporters)
+    return __doc__.format(
+        executable=__file__, importers=importers, exporters=exporters)
+
+
+def _porter(file, porters):
+    name, suffix = os.path.splitext(file)
+    try:
+        return porters[suffix]
+    except KeyError:
+        raise ValueError('Unrecognized suffix {!r}'.format(suffix))
+
+
+def replace_vars(var_map, target_var_map):
+    for key, item in var_map.items():
+        target_var_map[key] = item
+    return target_var_map
+
+
+def main():
+    args = docopt(usage(), version=__version__)
+    from_file = args['<from_file>']
+    rules = args['--rules']
+    if rules:
+        with open(rules, 'r') as f:
+            rules = yaml.load(f)
+    else:
+        rules = {}
+    importer_cls = _porter(from_file, _importers)
+    importer = importer_cls(from_file, rules)
+    permute_rules = rules.get('permute')
+    if permute_rules:
+        permute(importer.var_to_tensor, permute_rules)
+    if args['info']:
+        print(yaml.dump(importer.var_to_shape))
+    elif args['to']:
+        to_file = args['<to_file>']
+        directory = os.path.split(to_file)[0]
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        else:
+            directory = '.'
+        exporter_cls = _porter(to_file, _exporters)
+        exporter = exporter_cls(importer.var_to_tensor, rules)
+        exporter.export(to_file, args['--dry-run'])
+    elif args['replace']:
+        target_file = args['<to_file>']
+        # import target
+        importer_cls = _porter(target_file, _importers)
+        target_importer = importer_cls(target_file, rules)
+        # replace
+        replaced_var_to_tensor = replace_vars(
+            importer.var_to_tensor, target_importer.var_to_tensor)
+        exporter_cls = _porter(target_file, _exporters)
+        exporter = exporter_cls(replaced_var_to_tensor, rules)
+        exporter.export(target_file, args['--dry-run'])
+    else:
+        raise TypeError('Do not know what we should do.')
+
+
+if __name__ == "__main__":
+    main()
